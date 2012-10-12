@@ -45,6 +45,25 @@ def unlock(name):
     lockfile.close()
     del lockfiles[lockfile_path]
 
+def parse_lsof_output(lines):
+    users = set()
+    lockers = set()
+    pid = None
+
+    for line in lines:
+        if line[0] == 'p':
+            pid = int(line[1:])
+        elif line.lower() == 'lw':
+            assert pid is not None, "Encountered lock line before process line in lsof output"
+            lockers.add(pid)
+        elif line == 'l ':
+            assert pid is not None, "Encountered lock line before process line in lsof output"
+            users.add(pid)
+        else:
+            raise LookupError("Encountered unexpected line in lsof output: '%s'" % line)
+
+    return (users, lockers)
+
 def ensure_lock(name):
     """
     Try to lock, until succeeding.
@@ -60,16 +79,23 @@ def ensure_lock(name):
         logger.info("Resource for '%s' is already locked, checking by whom...", name)
         lockfile, lockfile_path = get_lockfile(name)
 
-        lines = subprocess.check_output(['lsof', '-Fl', lockfile_path]).splitlines()
-        # lines: ['p8008', 'l ', 'p31119', 'l ', 'p31918', 'lW']
-
-        locks = dict(zip([p[1:] for p in lines[0::2]],
-                         [l[1:] for l in lines[1::2] if l.lower() == 'lw']))
-        # locks: {'31918': 'W'}
+        lsof_output = subprocess.check_output(['lsof', '-Fl', lockfile_path])
+        logger.debug("lsof output: %s", lsof_output)
+        lines = lsof_output.splitlines()
+        lockfile_users, lockfile_lockers = parse_lsof_output(lines)
 
         # Kill anyone who locks our resource
-        for pid in locks:
-            kill_process(pid)
+        if lockfile_lockers:
+            for pid in lockfile_lockers:
+                logger.debug("Process %s has locked the resource; going to kill it", pid)
+                kill_process(pid)
+        else:
+            logger.debug("No processes found that lock the resource; "
+                         "since lock detection may be unreliable, "
+                         "we're going to kill all processes that have the resource open")
+            for pid in lockfile_users:
+                logger.debug("Process %s is using the resource and may have locked it; going to kill it", pid)
+                kill_process(pid)
 
 def kill_process(pid):
     """
@@ -77,21 +103,34 @@ def kill_process(pid):
     """
 
     pid = int(pid)
-    start_time = time.time()
-    soft_deadline = start_time + 20
-    hard_deadline = soft_deadline + 5
-    sig = signal.SIGTERM
+    if pid == os.getpid():
+        logger.debug("Refusing to commit suicide, skipping")
+        return
 
-    while time.time() < hard_deadline:
-        logging.debug("Killing process %s with signal %s", pid, sig)
+    remaining_signals = [(signal.SIGTERM, 10),
+                         (signal.SIGKILL, 5),]
+
+    while remaining_signals:
+        sig, time_to_wait = remaining_signals.pop(0)
+        logger.debug("Killing process %s with signal %s", pid, sig)
         try:
-            os.kill(pid, signal.SIGTERM)
+            os.kill(pid, sig)
         except EnvironmentError as e:
             if e.errno == errno.ESRCH:
                 return
 
-        logging.debug("Process not dead yet, sleeping...")
-        if time.time() > soft_deadline:
-            sig = signal.SIGKILL
+        start_time = time.time()
+        deadline = start_time + time_to_wait
 
-        time.sleep(1)
+        while time.time() < deadline:
+            logger.debug("Waiting for process %s to terminate...", pid)
+            try:
+                os.kill(pid, 0)
+            except EnvironmentError as e:
+                if e.errno == errno.ESRCH:
+                    return
+
+            logger.debug("Process not dead yet, sleeping...")
+            time.sleep(1)
+
+    logger.info("Killing process %s was unsuccessful!", pid)
