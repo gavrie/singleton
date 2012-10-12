@@ -15,10 +15,17 @@ Kill it if it is already running; abort on failure.
 
 logger = logging.getLogger()
 
-lockfiles = {}
+open_lockfiles = {}
 
 def get_lockfile(name):
     lockfile_path = "/tmp/{}.lock".format(name)
+
+    if lockfile_path in open_lockfiles:
+        # If we have an open filehandle, return it.
+        # This is necessary and not just an optimization, since closing the filehandle
+        # (even though the lock is on another filehandle!) will release the lock.
+        # See the man page for fcntl(2).
+        return (open_lockfiles[lockfile_path], lockfile_path)
 
     # Create lock file if it doesn't exist.
     # Be careful to make it world-writable so that other users can use it as well.
@@ -27,8 +34,8 @@ def get_lockfile(name):
     os.umask(old_umask)
 
     # Keep open filehandle
-    lockfiles[lockfile_path] = lockfile
-    return lockfile, lockfile_path
+    open_lockfiles[lockfile_path] = lockfile
+    return (lockfile, lockfile_path)
 
 def lock(name):
     """
@@ -43,7 +50,7 @@ def unlock(name):
     fcntl.lockf(lockfile, fcntl.LOCK_UN)
     logger.debug("Unlocked '%s' by pid %s", lockfile_path, os.getpid())
     lockfile.close()
-    del lockfiles[lockfile_path]
+    del open_lockfiles[lockfile_path]
 
 def parse_lsof_output(lines):
     users = set()
